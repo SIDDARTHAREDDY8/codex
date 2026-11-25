@@ -97,6 +97,33 @@ pub(crate) fn tool_log_payload<'a>(
     payload.log_payload()
 }
 
+/// Candidate (namespace, name) pairs for a flat tool name sent without an
+/// explicit namespace, in preference order.
+///
+/// * Dotted form (`multi_agent_v1.spawn_agent`, `fs.write_file`): split at
+///   the first `.`.
+/// * Double-underscore form (`multi_agent_v1__spawn_agent`,
+///   `mcp__<server>__<tool>`): split at the last `__` so server names
+///   containing `__` survive, and also try the trailing-`__` namespace form
+///   (`mcp__<server>__`) since MCP tools are registered under both spellings.
+fn flat_tool_name_candidates(name: &str) -> Vec<ToolName> {
+    let mut candidates = Vec::new();
+    if let Some((namespace, tool)) = name.split_once('.')
+        && !namespace.is_empty()
+        && !tool.is_empty()
+    {
+        candidates.push(ToolName::namespaced(namespace, tool));
+    }
+    if let Some((namespace, tool)) = name.rsplit_once("__")
+        && !namespace.is_empty()
+        && !tool.is_empty()
+    {
+        candidates.push(ToolName::namespaced(namespace, tool));
+        candidates.push(ToolName::namespaced(format!("{namespace}__"), tool));
+    }
+    candidates
+}
+
 /// One finalized tool plan: its advertised surfaces and matching executable runtimes.
 pub struct ToolRouter {
     registry: ToolRegistry,
@@ -282,6 +309,32 @@ impl ToolRouter {
         self.registry.registered_tool(tool_name)
     }
 
+    /// Resolves the [`ToolName`] for a function call, splitting a flat tool
+    /// name sent without an explicit namespace into its (namespace, name)
+    /// parts when the split names a registered tool.
+    ///
+    /// Some providers flatten namespaced tools into a single name (e.g.
+    /// `multi_agent_v1.spawn_agent` or `multi_agent_v1__spawn_agent`) with
+    /// `namespace: None`. Looking such a name up under the default namespace
+    /// misses the registered handler and the model gets an "unsupported call"
+    /// error. An explicit namespace always wins, and names that do not
+    /// resolve to a registered tool keep the previous behavior so diagnostics
+    /// still show exactly what the model sent.
+    fn resolve_flat_tool_name(&self, namespace: &Option<String>, name: &str) -> ToolName {
+        if let Some(namespace) = namespace
+            .as_deref()
+            .filter(|namespace| !namespace.is_empty())
+        {
+            return ToolName::namespaced(namespace, name).with_default_namespace();
+        }
+        for candidate in flat_tool_name_candidates(name) {
+            if self.registry.registered_tool(&candidate).is_some() {
+                return candidate;
+            }
+        }
+        ToolName::new(None, name.to_string()).with_default_namespace()
+    }
+
     #[instrument(level = "trace", skip_all, err)]
     pub fn build_tool_call(
         &self,
@@ -296,8 +349,7 @@ impl ToolRouter {
                 ref mut encrypted_function_args,
                 ..
             } => {
-                let tool_name =
-                    ToolName::new(namespace.clone(), name.clone()).with_default_namespace();
+                let tool_name = self.resolve_flat_tool_name(namespace, name);
                 let retain_native_call = self
                     .registry
                     .registered_tool(&tool_name)

@@ -385,6 +385,165 @@ async fn build_tool_call_normalizes_default_function_and_custom_namespaces() -> 
 }
 
 #[tokio::test]
+async fn build_tool_call_splits_flat_tool_names_when_namespace_is_absent() -> anyhow::Result<()> {
+    // Regression: custom providers flatten namespaced tool calls into a single
+    // name (e.g. "multi_agent_v1.spawn_agent" or "multi_agent_v1__spawn_agent")
+    // with `namespace: None`. The router must split the name so the registry
+    // lookup matches the handler key registered under ToolName::namespaced;
+    // otherwise the model gets "unsupported call: <name>".
+    let (_, mut turn) = make_session_and_context().await;
+    turn.multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V1;
+    let step = StepContext::for_test(Arc::new(turn));
+    let router = test_tool_router(
+        &step,
+        vec![
+            mcp_runtime(mcp_tool_info(
+                "server",
+                /*supports_parallel_tool_calls*/ true,
+                "mcp__server",
+                "my_tool",
+            )),
+            mcp_runtime(mcp_tool_info(
+                "other",
+                /*supports_parallel_tool_calls*/ true,
+                "mcp__other__",
+                "other_tool",
+            )),
+        ],
+        Vec::new(),
+        &[],
+    );
+
+    // Flat dotted and double-underscore names resolve to the registered
+    // (namespace, name) handler.
+    for flat_name in ["multi_agent_v1.spawn_agent", "multi_agent_v1__spawn_agent"] {
+        let call_item = ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
+            id: None,
+            name: flat_name.to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            encrypted_function_args: None,
+            call_id: "call-flat".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let call = router
+            .build_tool_call(call_item)?
+            .expect("function_call should produce a tool call");
+        assert_eq!(
+            call.tool_name,
+            ToolName::namespaced("multi_agent_v1", "spawn_agent"),
+            "flat name {flat_name} must resolve to the registered (namespace, name) key"
+        );
+        assert!(
+            router.registered_tool(&call.tool_name).is_some(),
+            "flat name {flat_name} must resolve to a registered handler"
+        );
+    }
+
+    // Flat double-underscore MCP names resolve to the registered MCP handler,
+    // for both the `mcp__<server>` and the trailing-`__` `mcp__<server>__`
+    // namespace spellings.
+    for (flat_name, namespace, tool) in [
+        ("mcp__server__my_tool", "mcp__server", "my_tool"),
+        ("mcp__other__other_tool", "mcp__other__", "other_tool"),
+    ] {
+        let call_item = ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
+            id: None,
+            name: flat_name.to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            encrypted_function_args: None,
+            call_id: "call-flat-mcp".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let call = router
+            .build_tool_call(call_item)?
+            .expect("function_call should produce a tool call");
+        assert_eq!(
+            call.tool_name,
+            ToolName::namespaced(namespace, tool),
+            "flat name {flat_name} must resolve to the registered (namespace, name) key"
+        );
+        assert!(
+            router.registered_tool(&call.tool_name).is_some(),
+            "flat name {flat_name} must resolve to a registered handler"
+        );
+    }
+
+    // A plain (non-dotted) name with no namespace still lands in the default
+    // namespace.
+    let plain_item = ResponseItem::FunctionCall {
+        status: None,
+        encrypted_content: None,
+        id: None,
+        name: "lookup".to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        encrypted_function_args: None,
+        call_id: "call-plain".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let plain = router
+        .build_tool_call(plain_item)?
+        .expect("function_call should produce a tool call");
+    assert_eq!(
+        plain.tool_name,
+        ToolName::namespaced(DEFAULT_FUNCTION_NAMESPACE, "lookup"),
+        "plain names must keep the default namespace"
+    );
+
+    // An explicit namespace wins over any dotted name (existing behavior
+    // preserved).
+    let explicit_item = ResponseItem::FunctionCall {
+        status: None,
+        encrypted_content: None,
+        id: None,
+        name: "spawn_agent".to_string(),
+        namespace: Some("collaboration".to_string()),
+        arguments: "{}".to_string(),
+        encrypted_function_args: None,
+        call_id: "call-explicit".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let explicit = router
+        .build_tool_call(explicit_item)?
+        .expect("function_call should produce a tool call");
+    assert_eq!(
+        explicit.tool_name,
+        ToolName::namespaced("collaboration", "spawn_agent"),
+        "explicit namespace must not be altered"
+    );
+
+    // A flat name with no registered split keeps the previous behavior so
+    // diagnostics still show exactly what the model sent.
+    let unknown_item = ResponseItem::FunctionCall {
+        status: None,
+        encrypted_content: None,
+        id: None,
+        name: "nope.unknown_tool".to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        encrypted_function_args: None,
+        call_id: "call-unknown".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let unknown = router
+        .build_tool_call(unknown_item)?
+        .expect("function_call should produce a tool call");
+    assert_eq!(
+        unknown.tool_name,
+        ToolName::namespaced(DEFAULT_FUNCTION_NAMESPACE, "nope.unknown_tool"),
+        "unregistered flat names must keep the default namespace"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn mcp_parallel_support_uses_handler_data() -> anyhow::Result<()> {
     let (session, turn) = make_session_and_context().await;
     let turn = Arc::new(turn);
